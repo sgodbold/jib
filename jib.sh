@@ -136,16 +136,13 @@
 # MY SIMPLE JIB -- steve
 #
 # Reasoning:
-# - my jail host has 22 if_bridges, i have no idea where they came from, i'm blaming old jib
+# - my jail host has 22 if_bridges, i don't know why
 # - old jib assumes you have a physical NIC which my virtual test environment does not
-# - old jib has a complex mac creation algorithm. i think this is due to mac conflict bugs
-#   in the early days of if_epair https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=176671
-#   which seems to have been fixed since 2016
 #
 # Changes:
 # - don't create bridges
 # - use the requested ifname for the epair
-# - create an epair using ifconfig(8), add it to desired bridge, rename, up
+# - create an epair using ifconfig(8), add it to desired bridge, rename, set mac, up
 # - old jib is now simple jib :)
 
 pgm="${0##*/}" # Program basename
@@ -194,12 +191,69 @@ mustberoot_to_continue()
         fi
 }
 
+derive_mac()
+{
+        eval __mac_num=\${_${iface}_num:--1}
+        __mac_num=$(( $__mac_num + 1 ))
+        eval _${iface}_num=\$__mac_num
+
+        local __iface="$1" __name="$2" __var_to_set="$3" __var_to_set_b="$4"
+        local __iface_devid __new_devid __num __new_devid_b
+        #
+        # Calculate MAC address derived from given iface.
+        #
+        # The formula I'm using is ``NP:SS:SS:II:II:II'' where:
+        # + N denotes 4 bits used as a counter to support branching
+        #   each parent interface up to 15 times under the same jail
+        #   name (see S below).
+        # + P denotes the special nibble whose value, if one of
+        #   2, 6, A, or E (but usually 2) denotes a privately
+        #   administered MAC address (while remaining routable).
+        # + S denotes 16 bits, the sum(1) value of the jail name.
+        # + I denotes bits that are inherited from parent interface.
+        #
+        # The S bits are a CRC-16 checksum of NAME, allowing the jail
+        # to change link numbers in ng_bridge(4) without affecting the
+        # MAC address. Meanwhile, if...
+        #   + the jail NAME changes (e.g., it was duplicated and given
+        #     a new name with no other changes)
+        #   + the underlying network interface changes
+        #   + the jail is moved to another host
+        # the MAC address will be recalculated to a new, similarly
+        # unique value preventing conflict.
+        #
+        __iface_devid=$( ifconfig $__iface ether | awk '/ether/,$0=$2' )
+
+        # ??:??:??:II:II:II
+        __new_devid=${__iface_devid#??:??:??} # => :II:II:II
+        # => :SS:SS:II:II:II
+        __num=$( set -- `echo -n "$__name" | sum` && echo $1 )
+        __new_devid=$( printf :%02x:%02x \
+                $(( $__num >> 8 & 255 )) $(( $__num & 255 )) )$__new_devid
+        # => P:SS:SS:II:II:II
+        case "$__iface_devid" in
+           ?2:*) __new_devid=a$__new_devid __new_devid_b=e$__new_devid ;;
+        ?[Ee]:*) __new_devid=2$__new_devid __new_devid_b=6$__new_devid ;;
+              *) __new_devid=2$__new_devid __new_devid_b=e$__new_devid
+        esac
+        # => NP:SS:SS:II:II:II
+        __new_devid=$( printf %x $(( $__mac_num & 15 )) )$__new_devid
+        __new_devid_b=$( printf %x $(( $__mac_num & 15 )) )$__new_devid_b
+
+        #
+        # Return derivative MAC address(es)
+        #
+        eval $__var_to_set=\$__new_devid
+        eval $__var_to_set_b=\$__new_devid_b
+}
+
 jib_addm_usage="addm BRIDGE_NAME NAME"
 jib_addm_descr="Creates epair NAME and adds to bridge BRIDGE_NAME"
 jib_addm()
 {
         local bridge="$1"
         local name="$2"
+        local mac_a mac_b
 
         mustberoot_to_continue
 
@@ -215,6 +269,11 @@ jib_addm()
         # Rename the new interface
         ifconfig $new name "${name}a" || return
         ifconfig ${new%a}b name "${name}b" || return
+
+        derive_mac $bridge "$name" mac_a mac_b
+        ifconfig "${name}a" ether "${mac_a}" || return
+        ifconfig "${name}b" ether "${mac_b}" || return
+
         ifconfig "${name}a" up || return
         ifconfig "${name}b" up || return
 }
